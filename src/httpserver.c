@@ -1,4 +1,6 @@
 /*
+ * SPDX-License-Identifier: MIT
+ *
  * The MIT License (MIT)
  *
  * Copyright (c) <2017> <Stephan Gatzka>
@@ -27,144 +29,81 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "cio_error_code.h"
 #include "cio_eventloop.h"
 #include "cio_http_location_handler.h"
 #include "cio_http_server.h"
 #include "cio_util.h"
-#include "cio_websocket_location_handler.h"
-#include "cio_write_buffer.h"
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 static struct cio_eventloop loop;
-static struct cio_http_server http_server;
+static struct cio_http_server server;
 
-enum { AUTOBAHN_SERVER_PORT = 9001 };
-
-enum { READ_BUFFER_SIZE = 1024 };
-enum { IPV6_ADDRESS_SIZE = 16 };
+enum { HTTPSERVER_LISTEN_PORT = 8080 };
+enum { read_buffer_size = 2000 };
 
 static const uint64_t HEADER_READ_TIMEOUT = UINT64_C(5) * UINT64_C(1000) * UINT64_C(1000) * UINT64_C(1000);
 static const uint64_t BODY_READ_TIMEOUT = UINT64_C(5) * UINT64_C(1000) * UINT64_C(1000) * UINT64_C(1000);
 static const uint64_t RESPONSE_TIMEOUT = UINT64_C(1) * UINT64_C(1000) * UINT64_C(1000) * UINT64_C(1000);
 static const uint64_t CLOSE_TIMEOUT_NS = UINT64_C(1) * UINT64_C(1000) * UINT64_C(1000) * UINT64_C(1000);
+enum { IPV6_ADDRESS_SIZE = 16 };
 
-struct ws_autobahn_handler {
-	struct cio_websocket_location_handler ws_handler;
+static const char data[] = "<html><body><h1>Hello, World!</h1></body></html>";
+
+struct dummy_handler {
+	struct cio_http_location_handler handler;
 	struct cio_write_buffer wbh;
-	struct cio_write_buffer wb_message;
-	size_t echo_write_index;
-	bool start_new_write_chunk;
-	uint8_t echo_buffer[READ_BUFFER_SIZE];
+	struct cio_write_buffer wb;
 };
 
-static void free_autobahn_handler(struct cio_websocket_location_handler *wslh)
+static void free_dummy_handler(struct cio_http_location_handler *handler)
 {
-	struct ws_autobahn_handler *h = cio_container_of(wslh, struct ws_autobahn_handler, ws_handler);
-	free(h);
+	struct dummy_handler *dh = cio_container_of(handler, struct dummy_handler, handler);
+	free(dh);
 }
 
-static void read_handler(struct cio_websocket *ws, void *handler_context, enum cio_error err, size_t frame_length, uint8_t *data, size_t length, bool last_chunk, bool last_frame, bool is_binary);
-
-static void write_complete(struct cio_websocket *ws, void *handler_context, enum cio_error err)
+static enum cio_http_cb_return dummy_on_message_complete(struct cio_http_client *client)
 {
-	(void)handler_context;
-	if (err == CIO_SUCCESS) {
-		err = cio_websocket_read_message(ws, read_handler, NULL);
-		if (err != CIO_SUCCESS) {
-			fprintf(stderr, "could not start reading a new message!\n");
-		}
+	struct cio_http_location_handler *handler = client->current_handler;
+	struct dummy_handler *dh = cio_container_of(handler, struct dummy_handler, handler);
+	cio_write_buffer_const_element_init(&dh->wb, data, sizeof(data) - 1);
+	cio_write_buffer_queue_tail(&dh->wbh, &dh->wb);
+	enum cio_error err = client->write_response(client, CIO_HTTP_STATUS_OK, &dh->wbh, NULL);
+	if (cio_unlikely(err != CIO_SUCCESS)) {
+		fprintf(stderr, "writing response not allowed!");
+		client->close(client);
 	}
+
+	return CIO_HTTP_CB_SUCCESS;
 }
 
-static void read_handler(struct cio_websocket *ws, void *handler_context, enum cio_error err, size_t frame_length, uint8_t *data, size_t length, bool last_chunk, bool last_frame, bool is_binary)
-{
-	(void)handler_context;
-
-	if (err == CIO_SUCCESS) {
-		fprintf(stdout, "got message!\n");
-		struct cio_websocket_location_handler *handler = cio_container_of(ws, struct cio_websocket_location_handler, websocket);
-		struct ws_autobahn_handler *ah = cio_container_of(handler, struct ws_autobahn_handler, ws_handler);
-
-		if (frame_length <= READ_BUFFER_SIZE) {
-			memcpy(ah->echo_buffer + ah->echo_write_index, data, length);
-			ah->echo_write_index += length;
-			if (last_chunk) {
-				ah->echo_write_index = 0;
-				cio_write_buffer_head_init(&ah->wbh);
-				cio_write_buffer_const_element_init(&ah->wb_message, ah->echo_buffer, frame_length);
-				cio_write_buffer_queue_tail(&ah->wbh, &ah->wb_message);
-				cio_websocket_write_message_first_chunk(ws, cio_write_buffer_get_total_size(&ah->wbh), &ah->wbh, last_frame, is_binary, write_complete, NULL);
-			} else {
-				err = cio_websocket_read_message(ws, read_handler, NULL);
-			}
-		} else {
-			// make chunked transfers
-			cio_write_buffer_head_init(&ah->wbh);
-			cio_write_buffer_const_element_init(&ah->wb_message, data, length);
-			cio_write_buffer_queue_tail(&ah->wbh, &ah->wb_message);
-			if (ah->start_new_write_chunk) {
-				err = cio_websocket_write_message_first_chunk(ws, frame_length, &ah->wbh, last_frame, is_binary, write_complete, NULL);
-			} else {
-				err = cio_websocket_write_message_continuation_chunk(ws, &ah->wbh, write_complete, NULL);
-			}
-
-			ah->start_new_write_chunk = last_chunk;
-		}
-
-		if (err != CIO_SUCCESS) {
-			fprintf(stderr, "could not start writing message!\n");
-		}
-
-	} else if (err != CIO_EOF) {
-		fprintf(stderr, "read failure!\n");
-	}
-}
-
-static void on_connect(struct cio_websocket *ws)
-{
-	fprintf(stderr, "Connected!\n");
-	enum cio_error err = cio_websocket_read_message(ws, read_handler, NULL);
-	if (err != CIO_SUCCESS) {
-		fprintf(stderr, "could not start reading a new message!\n");
-	}
-}
-
-static void on_error(const struct cio_websocket *ws, enum cio_error err, const char *reason)
-{
-	(void)ws;
-	fprintf(stderr, "Unexpected error: %d, %s\n", err, reason);
-}
-
-static struct cio_http_location_handler *alloc_autobahn_handler(const void *config)
+static struct cio_http_location_handler *alloc_dummy_handler(const void *config)
 {
 	(void)config;
-	struct ws_autobahn_handler *handler = malloc(sizeof(*handler));
+	struct dummy_handler *handler = malloc(sizeof(*handler));
 	if (cio_unlikely(handler == NULL)) {
 		return NULL;
 	}
 
-	enum cio_error err = cio_websocket_location_handler_init(&handler->ws_handler, NULL, 0, on_connect, free_autobahn_handler);
-	if (cio_unlikely(err != CIO_SUCCESS)) {
-		free(handler);
-		return NULL;
-	}
-
-	cio_websocket_set_on_error_cb(&handler->ws_handler.websocket, on_error);
-	handler->echo_write_index = 0;
-	handler->start_new_write_chunk = true;
-	return &handler->ws_handler.http_location;
+	cio_http_location_handler_init(&handler->handler);
+	cio_write_buffer_head_init(&handler->wbh);
+	handler->handler.free = free_dummy_handler;
+	handler->handler.on_message_complete = dummy_on_message_complete;
+	return &handler->handler;
 }
 
 static struct cio_socket *alloc_http_client(void)
 {
-	struct cio_http_client *client = malloc(sizeof(*client) + READ_BUFFER_SIZE);
+	struct cio_http_client *client = malloc(sizeof(*client) + read_buffer_size);
 	if (cio_unlikely(client == NULL)) {
 		return NULL;
 	}
 
-	client->buffer_size = READ_BUFFER_SIZE;
+	client->buffer_size = read_buffer_size;
 	return &client->socket;
 }
 
@@ -180,13 +119,13 @@ static void http_server_closed(const struct cio_http_server *s)
 	cio_eventloop_cancel(&loop);
 }
 
-static void serve_error(struct cio_http_server *server, const char *reason)
+static void serve_error(struct cio_http_server *s, const char *reason)
 {
-	(void)reason;
-	cio_http_server_shutdown(server, http_server_closed);
+	fprintf(stderr, "http server error: %s\n", reason);
+	cio_http_server_shutdown(s, http_server_closed);
 }
 
-void  main(void)
+void main(void)
 {
 	enum cio_error err = cio_eventloop_init(&loop);
 	if (err != CIO_SUCCESS) {
@@ -200,27 +139,27 @@ void  main(void)
 	    .read_body_timeout_ns = BODY_READ_TIMEOUT,
 	    .response_timeout_ns = RESPONSE_TIMEOUT,
 	    .close_timeout_ns = CLOSE_TIMEOUT_NS,
+	    .use_tcp_fastopen = false,
 	    .alloc_client = alloc_http_client,
-	    .free_client = free_http_client,
-	    .use_tcp_fastopen = false};
+	    .free_client = free_http_client};
 
-	err = cio_init_inet_socket_address(&config.endpoint, cio_get_inet_address_any4(), AUTOBAHN_SERVER_PORT);
+	err = cio_init_inet_socket_address(&config.endpoint, cio_get_inet_address_any4(), HTTPSERVER_LISTEN_PORT);
 	if (err != CIO_SUCCESS) {
 		fprintf(stderr, "Error in cio_init_inet_socket_address\n");
 		goto destroy_loop;
 	}
 
-	err = cio_http_server_init(&http_server, &loop, &config);
+	err = cio_http_server_init(&server, &loop, &config);
 	if (err != CIO_SUCCESS) {
 		fprintf(stderr, "Error in cio_http_server_init\n");
 		goto destroy_loop;
 	}
 
-	struct cio_http_location autobahn_target;
-	cio_http_location_init(&autobahn_target, "/", NULL, alloc_autobahn_handler);
-	cio_http_server_register_location(&http_server, &autobahn_target);
+	struct cio_http_location target_foo;
+	cio_http_location_init(&target_foo, "/foo", NULL, alloc_dummy_handler);
+	cio_http_server_register_location(&server, &target_foo);
 
-	err = cio_http_server_serve(&http_server);
+	err = cio_http_server_serve(&server);
 	if (err != CIO_SUCCESS) {
 		fprintf(stderr, "Error in cio_http_server_serve\n");
 		goto destroy_loop;
